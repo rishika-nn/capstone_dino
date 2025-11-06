@@ -64,6 +64,8 @@ class BlipCaptionGenerator:
         logger.info(f"Using device: {self.device}")
         
         # Load model and processor
+        # model_family will be set in _load_model: either 'blip2' or 'blip'
+        self.model_family = None
         self._load_model()
         
     def _load_model(self):
@@ -71,26 +73,36 @@ class BlipCaptionGenerator:
         logger.info(f"Loading model: {self.model_name}")
         
         try:
-            # Load processor for image preprocessing
+            # Try loading as BLIP-2 / InstructBLIP (Blip2Processor + Blip2ForConditionalGeneration)
+            logger.info("Attempting to load model as BLIP-2 (Blip2Processor)")
             self.processor = Blip2Processor.from_pretrained(self.model_name)
-            
-            # Load model
             self.model = Blip2ForConditionalGeneration.from_pretrained(
                 self.model_name,
                 torch_dtype=torch.float16 if self.device.type == 'cuda' else torch.float32
             )
-            
-            # Move model to device
             self.model = self.model.to(self.device)
-            
-            # Set model to evaluation mode
             self.model.eval()
-            
-            logger.info("Model loaded successfully")
+            self.model_family = 'blip2'
+            logger.info("Loaded BLIP-2 / InstructBLIP model successfully")
             
         except Exception as e:
-            logger.error(f"Failed to load BLIP model: {e}")
-            raise
+            # If BLIP-2 loading fails, attempt to load classic BLIP (BlipProcessor)
+            logger.warning(f"BLIP-2 load failed: {e}. Attempting to load classic BLIP model as fallback...")
+            try:
+                from transformers import BlipProcessor, BlipForConditionalGeneration
+                self.processor = BlipProcessor.from_pretrained(self.model_name)
+                self.model = BlipForConditionalGeneration.from_pretrained(
+                    self.model_name,
+                    torch_dtype=torch.float16 if self.device.type == 'cuda' else torch.float32
+                )
+                self.model = self.model.to(self.device)
+                self.model.eval()
+                self.model_family = 'blip'
+                logger.info("Loaded classic BLIP model successfully (fallback)")
+            except Exception as e2:
+                logger.error(f"Failed to load BLIP fallback model: {e2}")
+                # Re-raise the original exception to inform the caller
+                raise
     
     def generate_captions(self, frames: List[FrameData], 
                          filter_empty: bool = True,
@@ -163,27 +175,49 @@ class BlipCaptionGenerator:
             # Use object-focused instruction prompt if none provided (for InstructBLIP)
             if not text_prompt:
                 text_prompt = "Describe the objects in this image, focusing on colors, sizes, and notable attributes like black backpack, red shirt"
-            
-            # Preprocess images with instruction prompt (InstructBLIP uses text as instruction)
-            inputs = self.processor(images=images, 
-                                   text=[text_prompt] * len(images),
-                                   return_tensors="pt", 
-                                   padding=True)
-            
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            
-            # Generate captions
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_length=self.max_length,
-                    num_beams=self.num_beams,
-                    do_sample=False,  # Deterministic generation
-                    early_stopping=True
-                )
-            
-            # Decode captions
-            captions = self.processor.batch_decode(outputs, skip_special_tokens=True)
+
+            # Prepare inputs depending on loaded model family
+            if self.model_family == 'blip2':
+                # Preprocess images with instruction prompt (InstructBLIP uses text as instruction)
+                inputs = self.processor(images=images, 
+                                       text=[text_prompt] * len(images),
+                                       return_tensors="pt", 
+                                       padding=True)
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+                # Generate captions
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        **inputs,
+                        max_length=self.max_length,
+                        num_beams=self.num_beams,
+                        do_sample=False,  # Deterministic generation
+                        early_stopping=True
+                    )
+
+                # Decode captions (batch)
+                captions = self.processor.batch_decode(outputs, skip_special_tokens=True)
+            else:
+                # Classic BLIP (no instruction text support in the same way)
+                inputs = self.processor(images=images, return_tensors="pt", padding=True)
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+                # Generate captions
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        **inputs,
+                        max_length=self.max_length,
+                        num_beams=self.num_beams,
+                        do_sample=False,
+                        early_stopping=True
+                    )
+
+                # Decode captions (processor.decode supports single output, use batch list comprehension)
+                try:
+                    captions = [self.processor.decode(o, skip_special_tokens=True) for o in outputs]
+                except Exception:
+                    # Fallback to batch_decode if available
+                    captions = self.processor.batch_decode(outputs, skip_special_tokens=True)
             
             # Clean up captions
             captions = [self._clean_caption(caption) for caption in captions]
@@ -227,38 +261,58 @@ class BlipCaptionGenerator:
         captions = []
         
         with torch.no_grad():
-            # Use instruction prompts for object-focused descriptions
-            # InstructBLIP works best with explicit instructions
-            for i, prompt in enumerate(self.object_prompts[:num_variants]):
-                inputs = self.processor(images=image, text=prompt, return_tensors="pt")
-                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            if self.model_family == 'blip2':
+                # Use instruction prompts for object-focused descriptions
+                # InstructBLIP works best with explicit instructions
+                for i, prompt in enumerate(self.object_prompts[:num_variants]):
+                    inputs = self.processor(images=image, text=prompt, return_tensors="pt")
+                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                    
+                    outputs = self.model.generate(
+                        **inputs,
+                        max_length=self.max_length,
+                        num_beams=self.num_beams,
+                        do_sample=False,
+                        early_stopping=True
+                    )
+                    caption = self.processor.decode(outputs[0], skip_special_tokens=True)
+                    captions.append(self._clean_caption(caption))
                 
-                outputs = self.model.generate(
-                    **inputs,
-                    max_length=self.max_length,
-                    num_beams=self.num_beams,
-                    do_sample=False,
-                    early_stopping=True
-                )
-                caption = self.processor.decode(outputs[0], skip_special_tokens=True)
-                captions.append(self._clean_caption(caption))
-            
-            # If we need more variants, generate with slightly different prompts
-            if len(captions) < num_variants:
-                fallback_prompt = "Describe all visible objects with their colors and key attributes"
-                inputs = self.processor(images=image, text=fallback_prompt, return_tensors="pt")
-                inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                
-                outputs = self.model.generate(
-                    **inputs,
-                    max_length=self.max_length,
-                    num_beams=self.num_beams,
-                    do_sample=True,
-                    temperature=0.7,
-                    early_stopping=True
-                )
-                caption = self.processor.decode(outputs[0], skip_special_tokens=True)
-                captions.append(self._clean_caption(caption))
+                # If we need more variants, generate with slightly different prompts
+                if len(captions) < num_variants:
+                    fallback_prompt = "Describe all visible objects with their colors and key attributes"
+                    inputs = self.processor(images=image, text=fallback_prompt, return_tensors="pt")
+                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                    
+                    outputs = self.model.generate(
+                        **inputs,
+                        max_length=self.max_length,
+                        num_beams=self.num_beams,
+                        do_sample=True,
+                        temperature=0.7,
+                        early_stopping=True
+                    )
+                    caption = self.processor.decode(outputs[0], skip_special_tokens=True)
+                    captions.append(self._clean_caption(caption))
+            else:
+                # Classic BLIP fallback: generate variants by sampling the image-only caption model
+                for i in range(num_variants):
+                    inputs = self.processor(images=image, return_tensors="pt")
+                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+                    outputs = self.model.generate(
+                        **inputs,
+                        max_length=self.max_length,
+                        num_beams=self.num_beams if i==0 else 1,
+                        do_sample=True,
+                        temperature=0.7 if i>0 else 0.0,
+                        early_stopping=True
+                    )
+                    try:
+                        caption = self.processor.decode(outputs[0], skip_special_tokens=True)
+                    except Exception:
+                        caption = self.processor.batch_decode(outputs, skip_special_tokens=True)[0]
+                    captions.append(self._clean_caption(caption))
         
         # Remove duplicates while preserving order
         seen = set()
